@@ -123,7 +123,7 @@ const SUBS = new Map(DATA.subs.map(s => [s.id, s])), TOPICS = new Map(DATA.topic
 const EX = DATA.exams, EXBY = new Map(EX.map(e => [e.id, e]));
 const POOL_TOTAL = Q.filter(q => !q.a).length;
 const LET = ['א', 'ב', 'ג', 'ד'];
-const EXAM_Q = 25;
+const EXAM_Q = 25, EXAM_MIN = 120, PASS = 60;
 const KEY = 'mitavechet.progress.v1';
 
 /* ---------------------------------- utils ---------------------------------- */
@@ -143,12 +143,24 @@ const topicOfSub = id => TOPICS.get(SUBS.get(id).topic);
 /* ---------------------------------- storage ---------------------------------- */
 let memOnly = false;
 function defState() {
-  return { v: 1, settings: {}, q: {}, days: {}, created: now() };
+  return { v: 1, settings: { simTimer: true }, q: {}, days: {}, sims: [], active: null, created: now() };
 }
 function load() {
-  try { const raw = localStorage.getItem(KEY); if (raw) { const s = JSON.parse(raw); if (s && s.v === 1) { s.settings = Object.assign(defState().settings, s.settings); return s; } } }
-  catch (e) { memOnly = true; }
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (raw) {
+      try { if (!localStorage.getItem(KEY + '.backup-pre-sims')) localStorage.setItem(KEY + '.backup-pre-sims', raw); } catch (e) { }
+      const s = JSON.parse(raw);
+      if (s && s.v === 1) return migrate(s);
+    }
+  } catch (e) { memOnly = true; }
   return defState();
+}
+function migrate(s) {          // additive only: never removes or rewrites existing progress
+  const d = defState();
+  s.settings = Object.assign(d.settings, s.settings || {});
+  s.q = s.q || {}; s.days = s.days || {}; s.sims = s.sims || []; if (s.active === undefined) s.active = null;
+  return s;
 }
 let saveT = 0;
 function save() {
@@ -293,7 +305,7 @@ function pickFromSub(sub, sess) {
 }
 
 /* ---------------------------------- UI state ---------------------------------- */
-const U = { screen: 'home', sess: null, modal: null, review: null, toast: '', mistFilter: 'all' };
+const U = { screen: 'home', sess: null, modal: null, review: null, toast: '', mistFilter: 'all', simRec: null, backTo: 'mistakes' };
 
 function askConfirm(msg, yes, label) { U.modal = { html: `<p><b>${esc(msg)}</b></p><button class="btn primary block" data-act="mYes">${esc(label || 'אישור')}</button>`, yes }; render(); }
 function toast(msg) { U.toast = msg; render(); setTimeout(() => { if (U.toast === msg) { U.toast = ''; render(); } }, 1800); }
@@ -365,6 +377,62 @@ function finishSession() {
 }
 function continueSession() { const s = U.sess; s.goal = s.asked + (s.type === 'drill' ? 5 : 10); s.done = false; nextQuestion(); }
 
+/* ---------------------------------- simulation ---------------------------------- */
+let simTimer = null;
+const examQs = id => Q.filter(q => EX[q.e].id === id).sort((a, b) => a.n - b.n);
+function buildMix() {
+  const pool = Q.filter(q => !q.a), byTopic = {};
+  pool.forEach(q => { const t = SUBS.get(q.sub).topic; (byTopic[t] = byTopic[t] || []).push(q); });
+  const quota = DATA.topics.map(t => ({ t, n: Math.max(1, Math.round(EXAM_Q * topicShare(t.id))) }));
+  let total = quota.reduce((a, x) => a + x.n, 0);
+  while (total > EXAM_Q) { quota.sort((a, b) => b.n - a.n)[0].n--; total--; }
+  while (total < EXAM_Q) { quota.sort((a, b) => b.n - a.n)[0].n++; total++; }
+  const pick = [];
+  for (const { t, n } of quota) {
+    const c = shuffle(byTopic[t.id] || []);
+    pick.push(...c.filter(q => !S.q[q.id]).concat(c.filter(q => S.q[q.id])).slice(0, n));   // unseen first
+  }
+  return shuffle(pick).map(q => q.id);
+}
+function startSim(kind, examId) {
+  if (S.active) return askConfirm('יש סימולציה פעילה. התחלת סימולציה חדשה תמחק אותה.', () => { S.active = null; startSim(kind, examId); }, 'להתחיל חדשה');
+  const ids = kind === 'mix' ? buildMix() : examQs(examId).map(q => q.id);
+  S.active = { kind, examId: examId || null, title: kind === 'mix' ? 'סימולציה אקראית' : EXBY.get(examId).t, ids, start: now(), answers: {}, flags: {}, idx: 0, timed: S.settings.simTimer !== false };
+  save(); go('simrun'); startSimTimer();
+}
+function resumeSim() { go('simrun'); startSimTimer(); }
+function simLeft() { const a = S.active; return a.start + EXAM_MIN * MIN - now(); }
+function simClock() { const a = S.active; return a.timed ? fmtTime(simLeft()) : fmtTime(now() - a.start); }
+function startSimTimer() {
+  clearInterval(simTimer);
+  simTimer = setInterval(() => {
+    if (U.screen !== 'simrun' || !S.active) { clearInterval(simTimer); return; }
+    const a = S.active, el = $('#simTimer');
+    if (a.timed && simLeft() <= 0) { clearInterval(simTimer); toast('הזמן נגמר, המבחן הוגש'); submitSim(true); return; }
+    if (el) { el.textContent = simClock(); el.classList.toggle('low', a.timed && simLeft() < 10 * MIN); }
+  }, 1000);
+}
+function submitSim(force) {
+  const a = S.active; if (!a) return;
+  const qs = a.ids.map(id => QBY.get(id));
+  if (!force) {
+    const un = qs.filter(q => a.answers[q.id] === undefined).length;
+    return askConfirm(un ? `נשארו ${un} שאלות ללא תשובה. להגיש בכל זאת?` : 'להגיש את המבחן?', () => submitSim(true), 'הגשה');
+  }
+  let correct = 0; const res = {};
+  qs.forEach(q => {
+    const sel = a.answers[q.id] === undefined ? -1 : a.answers[q.id];
+    const ok = isCorrect(q, sel); if (ok) correct++;
+    const flag = !!a.flags[q.id];
+    if (!q.a) record(q, sel, ok ? (flag ? 1 : 2) : (sel === -1 ? 0 : 1), 0, 'sim');
+    res[q.id] = { sel, ok, flag };
+  });
+  bump();
+  const rec = { id: now(), kind: a.kind, examId: a.examId, title: a.title, ts: now(), dur: a.timed ? Math.min(now() - a.start, EXAM_MIN * MIN) : now() - a.start, timed: a.timed, correct, total: qs.length, score: Math.round(correct / qs.length * 100), ids: a.ids, res };
+  S.sims.push(rec); S.active = null; save(); clearInterval(simTimer);
+  go('simresult', { simRec: rec });
+}
+
 /* ---------------------------------- view helpers ---------------------------------- */
 function cardHTML(subId, open) {
   const sb = SUBS.get(subId), c = sb.card;
@@ -433,9 +501,9 @@ function revealHTML(q, c, opts = {}) {
 
 /* ---------------------------------- screens ---------------------------------- */
 function navHTML() {
-  const t = ({ home: 'home', practicemenu: 'practice', practice: 'practice', summary: 'practice', review: 'practice', topics: 'topics', more: 'more', mistakes: 'more', settings: 'more', about: 'more' })[U.screen] || 'home';
+  const t = ({ home: 'home', practicemenu: 'practice', practice: 'practice', summary: 'practice', review: 'practice', sims: 'sims', simresult: 'sims', topics: 'topics', more: 'more', mistakes: 'more', settings: 'more', about: 'more' })[U.screen] || 'home';
   const b = (k, ic, l, scr) => `<button class="${t === k ? 'on' : ''}" data-act="nav" data-a="${scr}"><span>${ic}</span>${l}</button>`;
-  return `<nav class="nav"><div>${b('home', '🏠', 'בית', 'home')}${b('practice', '✏️', 'תרגול', 'practicemenu')}${b('topics', '📊', 'נושאים', 'topics')}${b('more', '⚙️', 'עוד', 'more')}</div></nav>`;
+  return `<nav class="nav"><div>${b('home', '🏠', 'בית', 'home')}${b('practice', '✏️', 'תרגול', 'practicemenu')}${b('sims', '⏱️', 'סימולציות', 'sims')}${b('topics', '📊', 'נושאים', 'topics')}${b('more', '⚙️', 'עוד', 'more')}</div></nav>`;
 }
 
 function overallStats() {
@@ -464,6 +532,7 @@ function homeView() {
       </div>
     </div>
     <div class="card"><div class="row between"><b>חזרות להיום</b><span class="pct">${due}</span></div><p class="small muted">שאלות שהגיע הזמן לרענן (מרווחי החזרה מותאמים לטעויות, להיסוס ולניחושים).</p><button class="btn sm" data-act="start" data-a="review" ${due ? '' : 'disabled'}>🔁 חזרה עכשיו</button></div>
+    <div class="card"><div class="row between wrap"><div><b>⏱️ סימולציות</b><div class="small muted">${S.sims.length ? `${S.sims.length} סימולציות · אחרונה: ${S.sims[S.sims.length - 1].score}` : 'מבחן מלא של 25 שאלות במתכונת האמיתית'}</div></div><button class="btn sm" data-act="nav" data-a="sims">למבחנים</button></div></div>
     ${ins.length ? `<div class="card"><h3>💡 מה האלגוריתם רואה</h3><div class="stack small">${ins.map(i => `<div>${i}</div>`).join('')}</div></div>` : ''}
     <div class="card">
       <h3>נקודות לחיזוק</h3>
@@ -546,9 +615,47 @@ function topicsView() {
     </div>`; }).join('')}</div>`;
 }
 
+function simsView() {
+  const act = S.active;
+  const exams = EX.slice().sort((a, b) => b.y * 100 + b.m - (a.y * 100 + a.m));
+  const taken = new Set(S.sims.filter(s => s.examId).map(s => s.examId));
+  const hist = S.sims.slice().reverse();
+  return `<div class="stack"><h1>סימולציות</h1>
+    <p class="muted small">מבחן במתכונת האמיתית: ${EXAM_Q} שאלות, ${EXAM_MIN} דקות, בלי רמזים ובלי משוב עד ההגשה. ציון עובר ${PASS}. התוצאות נכנסות למודל: שאלות שנענו לא נכון יחזרו בתרגול.</p>
+    ${act ? `<div class="banner warn">יש סימולציה פעילה: ${esc(act.title)} <button class="btn sm primary" data-act="simresume">המשך</button></div>` : ''}
+    <div class="card stack"><div class="row between wrap"><div><b>🎲 סימולציה אקראית</b><div class="small muted">25 שאלות לפי התפלגות הנושאים במבחן, בעדיפות לשאלות שטרם נענו</div></div><button class="btn primary" data-act="simstart" data-a="mix">התחלה</button></div>
+      <label class="small"><input type="checkbox" data-act="simtimer" ${S.settings.simTimer !== false ? 'checked' : ''}> עם שעון (${EXAM_MIN} דקות)</label></div>
+    ${hist.length ? `<div class="card"><h3>היסטוריה</h3>${hist.slice(0, 12).map(s => `<div class="trow"><div class="nm"><b>${esc(s.title)}</b><div class="tag">${new Date(s.ts).toLocaleDateString('he-IL')} · ${s.correct}/${s.total}</div></div><span class="chip ${s.score >= PASS ? 'good' : 'bad'}">${s.score}</span><button class="btn sm ghost" data-act="simview" data-a="${s.id}">תוצאות</button></div>`).join('')}
+      ${hist.length > 1 ? `<div class="row" style="align-items:flex-end;height:80px;gap:6px;margin-top:10px">${S.sims.slice(-12).map(s => `<div class="grow center small"><div style="height:${Math.max(6, s.score * 0.6)}px;background:${s.score >= PASS ? 'var(--good)' : 'var(--bad)'};border-radius:6px 6px 0 0"></div>${s.score}</div>`).join('')}</div>` : ''}</div>` : ''}
+    <div class="card"><h3>מבחנים אמיתיים מהעבר</h3><p class="small muted">"כבר נענו" = כמה מ-25 השאלות כבר הופיעו אצלך בתרגול. כדי שהציון ישקף ידע אמיתי עדיף מבחן עם מעט שאלות שכבר נענו.</p>
+      ${exams.map(e => { const ids = examQs(e.id).map(q => q.id), seen = ids.filter(i => S.q[i]).length; return `<div class="trow"><div class="nm"><b>${esc(e.t)}</b><div class="tag">כבר נענו ${seen}/${ids.length}${taken.has(e.id) ? ' · נפתר כסימולציה' : ''}</div></div><button class="btn sm ${seen === 0 ? 'primary' : ''}" data-act="simstart" data-a="exam" data-b="${e.id}">התחלה</button></div>`; }).join('')}</div></div>`;
+}
+function simRunView() {
+  const a = S.active, qs = a.ids.map(id => QBY.get(id)), q = qs[a.idx], sel = a.answers[q.id];
+  return `<div class="stack">
+    <div class="qhead"><button class="btn sm ghost" data-act="simleave">✕ יציאה</button><div class="grow center"><b>${esc(a.title)}</b></div><span class="timer" id="simTimer">${simClock()}</span></div>
+    <div class="qgrid">${qs.map((x, i) => `<button class="${i === a.idx ? 'cur ' : ''}${a.flags[x.id] ? 'flag' : a.answers[x.id] !== undefined ? 'ans' : ''}" data-act="simgo" data-a="${i}">${i + 1}</button>`).join('')}</div>
+    <div class="card"><div class="row between"><b>שאלה ${a.idx + 1} מתוך ${qs.length}</b><button class="btn sm ${a.flags[q.id] ? '' : 'ghost'}" data-act="simflag">${a.flags[q.id] ? '🚩 מסומנת לבדיקה' : '🏳 סימון לבדיקה'}</button></div>
+      <div class="stem">${paras(q.s)}</div>
+      ${q.o.map((o, i) => `<button class="opt ${sel === i ? 'sel' : ''}" data-act="simopt" data-a="${i}"><span class="l">${LET[i]}</span><span>${esc(o)}</span></button>`).join('')}
+      <div class="row between" style="margin-top:12px"><button class="btn ghost sm" data-act="simclear" ${sel === undefined ? 'disabled' : ''}>ניקוי תשובה</button></div></div>
+    <div class="row"><button class="btn ghost grow" data-act="simgo" data-a="${Math.max(0, a.idx - 1)}" ${a.idx === 0 ? 'disabled' : ''}>→ הקודמת</button><button class="btn grow" data-act="simgo" data-a="${Math.min(qs.length - 1, a.idx + 1)}" ${a.idx === qs.length - 1 ? 'disabled' : ''}>הבאה ←</button></div>
+    <button class="btn primary block" data-act="simsubmit">הגשת המבחן (${Object.keys(a.answers).length}/${qs.length} נענו)</button></div>`;
+}
+function simResultView() {
+  const rec = U.simRec, qs = rec.ids.map(id => QBY.get(id));
+  const byT = {}; qs.forEach(q => { const t = topicOfSub(q.sub).label; (byT[t] = byT[t] || { n: 0, ok: 0 }); byT[t].n++; byT[t].ok += rec.res[q.id].ok ? 1 : 0; });
+  const wrong = qs.filter(q => !rec.res[q.id].ok), pass = rec.score >= PASS;
+  const prev = S.sims.filter(s => s.id !== rec.id && s.ts < rec.ts).slice(-1)[0];
+  return `<div class="stack"><h1>תוצאות · ${esc(rec.title)}</h1>
+    <div class="card hero center"><div class="big" style="font-size:3.4rem">${rec.score}</div><div style="font-weight:800;margin-top:6px">${pass ? '✔ ציון עובר (' + PASS + ')' : '✘ מתחת לציון העובר (' + PASS + ')'}</div><div class="small muted">${rec.correct}/${rec.total} נכונות · זמן ${fmtTime(rec.dur)}${rec.timed ? ' מתוך ' + EXAM_MIN + ':00' : ''}${prev ? ' · הקודם: ' + prev.score : ''}</div></div>
+    <div class="card"><h3>לפי נושא</h3>${Object.entries(byT).sort((a, b) => a[1].ok / a[1].n - b[1].ok / b[1].n).map(([t, x]) => `<div class="trow"><div class="nm">${esc(t)}</div><div class="bar ${x.ok / x.n >= .7 ? 'good' : x.ok / x.n >= .5 ? '' : 'bad'}" style="width:90px"><i style="width:${x.ok / x.n * 100}%"></i></div><div class="pct">${x.ok}/${x.n}</div></div>`).join('')}</div>
+    <div class="card"><h3>מעבר שאלה אחר שאלה</h3><p class="small muted">ירוק = נכון, אדום = שגוי. לחיצה פותחת את התשובה הנכונה וכרטיס הנושא.</p><div class="qgrid">${qs.map((q, i) => `<button class="${rec.res[q.id].ok ? 'good' : 'bad'}" data-act="simq" data-a="${q.id}">${i + 1}</button>`).join('')}</div></div>
+    <div class="row wrap">${wrong.filter(q => !q.a).length ? `<button class="btn primary grow" data-act="wrongdrill">🎯 תרגול על ${wrong.length} הטעויות</button>` : ''}<button class="btn ghost" data-act="nav" data-a="sims">לסימולציות</button></div></div>`;
+}
 function reviewView() {
-  const q = QBY.get(U.review.id);
-  const c = { sel: null, rev: true, ok: null, conf: null, gap: true };
+  const q = QBY.get(U.review.id), rec = U.review.rec, rr = rec && rec.res[q.id];
+  const c = rr ? { sel: rr.sel, rev: true, ok: rr.ok, conf: rr.flag ? 1 : (rr.sel === -1 ? 0 : 2), gap: !rr.ok || rr.flag } : { sel: null, rev: true, ok: null, conf: null, gap: true };
   return `<div class="stack"><div class="row"><button class="btn sm ghost" data-act="back">→ חזרה</button><b>${esc(EX[q.e].t)} · שאלה ${q.n}</b></div>
     <div class="card"><div class="stem">${paras(q.s)}</div>${optionsHTML(q, c, true)}${revealHTML(q, c)}</div></div>`;
 }
@@ -581,6 +688,7 @@ function aboutView() {
     <div><h3>🎯 בחירת השאלה הבאה</h3><p class="small">כל שאלה מקבלת משקל לפי: מידת החולשה בנושא שלה, כמה הנושא מופיע במבחן, האם הגיע זמן לחזור עליה, והאם הייתה בה טעות בביטחון. לא חוזרים על אותו נושא ברצף, כי שילוב נושאים משפר זכרון. שאלות ששלטים בהן מופיעות לעיתים רחוקות.</p></div>
     <div><h3>🔁 חזרה מרווחת</h3><p class="small">שאלה שנענתה לא נכון חוזרת באותו סשן אחרי כמה שאלות, ואחר כך אחרי כמה דקות, יום, 3 ימים, שבוע ועוד. היסוס וניחוש מקצרים את המרווח.</p></div>
     <div><h3>📘 אחרי כל פער</h3><p class="small">טעות, היסוס או ניחוש מציגים כרטיס הסבר לנושא, ושאלות נוספות מאותו תת־נושא משולבות בהמשך הסשן. אפשר גם לפתוח תרגול ממוקד מיד.</p></div>
+    <div><h3>⏱ סימולציות</h3><p class="small">מבחן של 25 שאלות במתכונת האמיתית (120 דקות, ציון עובר 60): מבחן אמיתי מהעבר או סימולציה אקראית. בסוף מקבלים ציון, פירוט לפי נושא ואפשרות לתרגל את הטעויות. התוצאות נכנסות למודל, ושאלות שנענו לא נכון יחזרו בתרגול.</p></div>
     <div><h3>⚠️ חשוב לדעת</h3><p class="small">השאלות והתשובות הרשמיות נלקחו מאתר איגוד המתווכים (reba.org.il) ומשקפות את הדין בזמן המבחן. מדרגות מס, סכומים ותקופות משתנים עם השנים. כרטיסי הנושא הם תמצית לימודית ולא ייעוץ משפטי. תיוג הנושאים נעשה אוטומטית עם תיקון ידני, ולכן ייתכנו טעויות בודדות.</p></div></div></div>`;
 }
 
@@ -591,12 +699,15 @@ function render() {
   else if (s === 'practice') html = practiceView();
   else if (s === 'summary') html = summaryView();
   else if (s === 'topics') html = topicsView();
+  else if (s === 'sims') html = simsView();
+  else if (s === 'simrun') html = simRunView();
+  else if (s === 'simresult') html = simResultView();
   else if (s === 'review') html = reviewView();
   else if (s === 'mistakes') html = mistakesView();
   else if (s === 'more') html = moreView();
   else if (s === 'settings') html = settingsView();
   else if (s === 'about') html = aboutView();
-  const focus = s === 'practice';
+  const focus = s === 'practice' || s === 'simrun';
   const modal = U.modal ? `<div class="modal" data-act="closemodal"><div data-act="stop">${U.modal.html}<button class="btn block" style="margin-top:12px" data-act="closemodal">סגירה</button></div></div>` : '';
   $('#app').innerHTML = html + (focus ? '' : navHTML()) + modal + (U.toast ? `<div class="toast"><div>${esc(U.toast)}</div></div>` : '');
 }
@@ -621,15 +732,27 @@ document.addEventListener('click', e => {
   if (act === 'card') { U.modal = { html: cardHTML(a, true) }; return render(); }
   if (act === 'mfilter') { U.mistFilter = a; return render(); }
   if (act === 'mlist') { const ids = shuffle(mistakes().filter(q => matchFilter(q, U.mistFilter)).map(q => q.id)).slice(0, 15); return startSession('list', { ids }); }
-  if (act === 'mview') { U.review = { id: a }; return go('review'); }
-  if (act === 'back') return go('mistakes');
+  if (act === 'mview') { U.review = { id: a, rec: null }; U.backTo = 'mistakes'; return go('review'); }
+  if (act === 'back') return go(U.backTo || 'mistakes');
+  if (act === 'simstart') return startSim(a, el.dataset.b);
+  if (act === 'simresume') return resumeSim();
+  if (act === 'simgo') { S.active.idx = +a; save(); return render(); }
+  if (act === 'simopt') { const q = QBY.get(S.active.ids[S.active.idx]); S.active.answers[q.id] = +a; save(); return render(); }
+  if (act === 'simclear') { const q = QBY.get(S.active.ids[S.active.idx]); delete S.active.answers[q.id]; save(); return render(); }
+  if (act === 'simflag') { const q = QBY.get(S.active.ids[S.active.idx]); if (S.active.flags[q.id]) delete S.active.flags[q.id]; else S.active.flags[q.id] = 1; save(); return render(); }
+  if (act === 'simsubmit') return submitSim(false);
+  if (act === 'simleave') { clearInterval(simTimer); return go('sims'); }
+  if (act === 'simview') { const rec = S.sims.find(x => String(x.id) === a); return rec ? go('simresult', { simRec: rec }) : null; }
+  if (act === 'simq') { U.review = { id: a, rec: U.simRec }; U.backTo = 'simresult'; return go('review'); }
+  if (act === 'wrongdrill') { const ids = U.simRec.ids.filter(id => !U.simRec.res[id].ok && !QBY.get(id).a); return ids.length ? startSession('list', { ids: shuffle(ids) }) : null; }
   if (act === 'export') return exportData();
   if (act === 'reset') return askConfirm('למחוק את כל ההתקדמות? אי אפשר לשחזר (אלא מקובץ גיבוי).', () => { S = defState(); bump(); save(); toast('ההתקדמות אופסה'); go('home'); }, 'מחיקה');
 });
 document.addEventListener('change', e => {
   const t = e.target;
+  if (t.dataset && t.dataset.act === 'simtimer') { S.settings.simTimer = t.checked; save(); return; }
   if (t.id === 'imp' && t.files[0]) {
-    const fr = new FileReader(); fr.onload = () => { try { const j = JSON.parse(fr.result); if (j.v !== 1) throw 0; S = j; S.settings = Object.assign(defState().settings, S.settings); bump(); save(); toast('הייבוא הושלם ✔'); go('home'); } catch (err) { toast('הקובץ אינו תקין'); } }; fr.readAsText(t.files[0]);
+    const fr = new FileReader(); fr.onload = () => { try { const j = JSON.parse(fr.result); if (j.v !== 1) throw 0; S = migrate(j); bump(); save(); toast('הייבוא הושלם ✔'); go('home'); } catch (err) { toast('הקובץ אינו תקין'); } }; fr.readAsText(t.files[0]);
   }
 });
 document.addEventListener('keydown', e => {
